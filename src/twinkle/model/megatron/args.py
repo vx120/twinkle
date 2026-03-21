@@ -6,12 +6,13 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional
 
-from twinkle import DeviceMesh
+from twinkle import DeviceMesh, Platform, get_logger
 from twinkle.utils import exists
 from .utils import convert_hf_config
 
 # Global args storage
 _GLOBAL_ARGS: Optional['TwinkleMegatronArgs'] = None
+logger = get_logger()
 
 
 def get_args() -> 'TwinkleMegatronArgs':
@@ -484,7 +485,16 @@ class TwinkleMegatronArgs:
         from megatron.core.distributed import finalize_model_grads as _native_finalize_model_grads
 
         def finalize_model_grads_for_lora(model, *args, **kwargs):
+            import importlib
+
             from megatron.core.distributed import DistributedDataParallel as MegatronDDP
+            from megatron.core.distributed.finalize_model_grads import (
+                _get_main_grad_attr,
+                _reshard_if_dtensor,
+                _unshard_if_dtensor,
+                get_attr_wrapped_model,
+            )
+            from megatron.core import parallel_state
             from peft import PeftModel as _PeftModel
 
             # Check if model is DDP-wrapped (has ddp_config)
@@ -494,10 +504,66 @@ class TwinkleMegatronArgs:
                     return _get_base_model(m.base_model.model)
                 return m
 
+            def _allreduce_word_embedding_grads_allow_none(model, config):
+                """
+                Megatron's native finalize path assumes the shared embedding / output
+                weight always has a grad. That is not true for LoRA fine-tuning when
+                the tied base embedding is frozen, so guard the all-reduce here
+                instead of letting it crash on ``None``.
+                """
+                if (
+                    parallel_state.is_rank_in_embedding_group(ignore_virtual=True)
+                    and torch.distributed.get_world_size(parallel_state.get_embedding_group()) > 1
+                ):
+                    if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+                        model_module = model[0]
+                    elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                        model_module = model[-1]
+                    else:
+                        model_module = model[0]
+
+                    ddp_config = model_module.ddp_config
+                    model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
+
+                    if model_module.share_embeddings_and_output_weights or getattr(config, 'mtp_num_layers', 0):
+                        weight = model_module.shared_embedding_or_output_weight()
+                        if weight is None:
+                            logger.warning_once(
+                                'Megatron LoRA finalize skipped shared embedding/output weight all-reduce '
+                                'because the tied weight is missing on this pipeline stage.',
+                                hash_id='megatron_lora_skip_embedding_allreduce_missing_weight',
+                            )
+                            return
+
+                        grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
+                        orig_grad = getattr(weight, grad_attr, None)
+                        grad = _unshard_if_dtensor(orig_grad)
+                        if grad is None:
+                            logger.warning_once(
+                                'Megatron LoRA finalize skipped shared embedding/output weight all-reduce '
+                                'because the tied weight has no grad. This is expected when LoRA freezes '
+                                'the base embedding/output weight.',
+                                hash_id='megatron_lora_skip_embedding_allreduce_none_grad',
+                            )
+                            return
+
+                        torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
+                        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+
             base_model = _get_base_model(model[0])
             if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'finish_grad_sync'):
-                # Use native implementation for DDP models
-                return _native_finalize_model_grads(model, *args, **kwargs)
+                # Use native implementation for DDP models, but guard the shared
+                # embedding all-reduce so LoRA-frozen tied weights do not crash on
+                # ``None`` grads.
+                finalize_model_grads_mod = importlib.import_module(
+                    'megatron.core.distributed.finalize_model_grads'
+                )
+                orig_allreduce_word_embedding_grads = finalize_model_grads_mod._allreduce_word_embedding_grads
+                finalize_model_grads_mod._allreduce_word_embedding_grads = _allreduce_word_embedding_grads_allow_none
+                try:
+                    return _native_finalize_model_grads(model, *args, **kwargs)
+                finally:
+                    finalize_model_grads_mod._allreduce_word_embedding_grads = orig_allreduce_word_embedding_grads
 
             return
 
@@ -573,6 +639,7 @@ class TwinkleMegatronArgs:
         bias_activation_fusion = use_swiglu and not has_bias
         if 'moe_token_dispatcher_type' not in moe_kwargs:
             moe_kwargs['moe_token_dispatcher_type'] = 'alltoall' if self.variable_seq_lengths else 'allgather'
+        is_npu = Platform.device_prefix() == 'npu'
         config = TransformerConfig(
             num_layers=num_layers,
             hidden_size=mg_config_dict['hidden_size'],
@@ -603,11 +670,15 @@ class TwinkleMegatronArgs:
             hidden_dropout=0.0,
             attention_dropout=0.0,
             # Performance optimizations
-            masked_softmax_fusion=True,  # Fused attention softmax
+            # NPU fallback: the current environment does not provide the TBE-backed
+            # fused softmax kernel that MindSpeed's NPU path selects by default.
+            # Keep the GPU fast path unchanged, but fall back to unfused softmax on NPU
+            # so attention can run without a hard dependency on `tbe`.
+            masked_softmax_fusion=not is_npu,
             bias_dropout_fusion=True,  # Fused bias + dropout
             apply_rope_fusion=True,  # Fused RoPE application
             attention_softmax_in_fp32=True,  # Numerical stability
-            attention_backend=AttnBackend.flash,  # FlashAttention for speed
+            attention_backend=AttnBackend.unfused if is_npu else AttnBackend.flash,
             # Activation recomputation for memory efficiency
             recompute_granularity=self.recompute_granularity,
             recompute_modules=self.recompute_modules if self.recompute_granularity == 'selective' else None,
