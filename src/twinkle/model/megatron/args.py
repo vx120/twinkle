@@ -333,10 +333,13 @@ class TwinkleMegatronArgs:
 
         model_type = getattr(hf_config, 'model_type', 'qwen2')
 
-        # Detect multimodal model from the registered MegatronModelMeta
-        from .model.register import get_megatron_model_meta
-        model_meta = get_megatron_model_meta(model_type)
-        is_multimodal = model_meta.is_multimodal if model_meta is not None else False
+        # Detect multimodal models without importing the Megatron registry.
+        # The registry import chain can pull in megatron.core, which must stay
+        # behind the MindSpeed bootstrap on NPU.
+        from .model.constant import MLLMModelType
+        is_multimodal = model_type in {
+            value for key, value in vars(MLLMModelType).items() if not key.startswith('_')
+        }
 
         # Determine QKV bias
         if hasattr(text_config, 'attention_bias'):
@@ -470,9 +473,14 @@ class TwinkleMegatronArgs:
                 # Recompute all layers for maximum memory savings
                 recompute_num_layers = num_layers // self.pp_size
 
-        # Create finalize_model_grads function for DP gradient synchronization
-        # Megatron's native finalize_model_grads requires DDP-wrapped models with ddp_config.
-        # For PEFT/LoRA models, we use a custom implementation that handles non-DDP models.
+        # Create finalize_model_grads function for DP gradient synchronization.
+        # Megatron's native finalize_model_grads ultimately calls finish_grad_sync(),
+        # so a bare model that only carries ddp_config is still not enough.
+        # We hit this in the NPU 1-step smoke: wrap_model() only attached ddp_config
+        # for the world_size=1 path, but native finalize still tried to call
+        # finish_grad_sync() and failed with:
+        # `RuntimeError: native finalize_model_grads was called on a model without finish_grad_sync`.
+        # For PEFT/LoRA or single-rank no-op wrap cases, skip native finalize.
         from megatron.core.distributed import finalize_model_grads as _native_finalize_model_grads
 
         def finalize_model_grads_for_lora(model, *args, **kwargs):
@@ -487,7 +495,7 @@ class TwinkleMegatronArgs:
                 return m
 
             base_model = _get_base_model(model[0])
-            if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'ddp_config'):
+            if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'finish_grad_sync'):
                 # Use native implementation for DDP models
                 return _native_finalize_model_grads(model, *args, **kwargs)
 
