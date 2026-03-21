@@ -678,7 +678,7 @@ class TwinkleMegatronArgs:
             bias_dropout_fusion=True,  # Fused bias + dropout
             apply_rope_fusion=True,  # Fused RoPE application
             attention_softmax_in_fp32=True,  # Numerical stability
-            attention_backend=AttnBackend.unfused if is_npu else AttnBackend.flash,
+            attention_backend=AttnBackend.flash,
             # Activation recomputation for memory efficiency
             recompute_granularity=self.recompute_granularity,
             recompute_modules=self.recompute_modules if self.recompute_granularity == 'selective' else None,
