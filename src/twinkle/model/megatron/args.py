@@ -474,14 +474,17 @@ class TwinkleMegatronArgs:
                 # Recompute all layers for maximum memory savings
                 recompute_num_layers = num_layers // self.pp_size
 
-        # Create finalize_model_grads function for DP gradient synchronization.
-        # Megatron's native finalize_model_grads ultimately calls finish_grad_sync(),
-        # so a bare model that only carries ddp_config is still not enough.
-        # We hit this in the NPU 1-step smoke: wrap_model() only attached ddp_config
-        # for the world_size=1 path, but native finalize still tried to call
-        # finish_grad_sync() and failed with:
-        # `RuntimeError: native finalize_model_grads was called on a model without finish_grad_sync`.
-        # For PEFT/LoRA or single-rank no-op wrap cases, skip native finalize.
+        # Custom finalize_model_grads for LoRA, registered via TransformerConfig.
+        # Fixes two issues with Megatron's native finalize_model_grads:
+        #
+        # 1. Bare models (single-rank / no-op wrap) only carry ddp_config but lack
+        #    finish_grad_sync(), so we gate on real DDP capability instead.
+        #
+        # 2. In multi-rank LoRA + PP, native _allreduce_word_embedding_grads assumes
+        #    shared embedding/output weight always has a grad. LoRA freezes the base
+        #    weight so grad is None -> all_reduce(None) crashes. We monkey-patch that
+        #    one helper to skip None grads, reusing the rest of native finalize via
+        #    try/finally to avoid forking the entire module.
         from megatron.core.distributed import finalize_model_grads as _native_finalize_model_grads
 
         def finalize_model_grads_for_lora(model, *args, **kwargs):
@@ -497,19 +500,17 @@ class TwinkleMegatronArgs:
             from megatron.core import parallel_state
             from peft import PeftModel as _PeftModel
 
-            # Check if model is DDP-wrapped (has ddp_config)
-            # Need to unwrap PeftModel to check the underlying model
+            # Unwrap PeftModel -> LoraModel -> real model to check DDP capability.
             def _get_base_model(m):
                 if isinstance(m, _PeftModel):
                     return _get_base_model(m.base_model.model)
                 return m
 
             def _allreduce_word_embedding_grads_allow_none(model, config):
-                """
-                Megatron's native finalize path assumes the shared embedding / output
-                weight always has a grad. That is not true for LoRA fine-tuning when
-                the tied base embedding is frozen, so guard the all-reduce here
-                instead of letting it crash on ``None``.
+                """None-safe drop-in for Megatron's _allreduce_word_embedding_grads.
+
+                Skips all-reduce when weight is absent (pipeline stage without tied
+                weight) or grad is None (LoRA-frozen base embedding/output weight).
                 """
                 if (
                     parallel_state.is_rank_in_embedding_group(ignore_virtual=True)
@@ -550,11 +551,10 @@ class TwinkleMegatronArgs:
                         torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
                         setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
+            # Fix 1: check real DDP capability, not just ddp_config presence.
             base_model = _get_base_model(model[0])
             if isinstance(base_model, MegatronDDP) or hasattr(base_model, 'finish_grad_sync'):
-                # Use native implementation for DDP models, but guard the shared
-                # embedding all-reduce so LoRA-frozen tied weights do not crash on
-                # ``None`` grads.
+                # Fix 2: temporarily swap in the None-safe embedding allreduce.
                 finalize_model_grads_mod = importlib.import_module(
                     'megatron.core.distributed.finalize_model_grads'
                 )
@@ -565,6 +565,7 @@ class TwinkleMegatronArgs:
                 finally:
                     finalize_model_grads_mod._allreduce_word_embedding_grads = orig_allreduce_word_embedding_grads
 
+            # Bare model (single-rank / no-op wrap): no DDP sync, skip.
             return
 
         # MoE configuration
