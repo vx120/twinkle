@@ -55,6 +55,16 @@ def _allreduce_word_embedding_grads_allow_none(*call_args, **call_kwargs):
     if pp_group is None:
         pp_group = parallel_state.get_pipeline_model_parallel_group()
 
+    def _get_main_grad_attr_compat(weight, ddp_config):
+        try:
+            helper_params = inspect.signature(_get_main_grad_attr).parameters
+        except (TypeError, ValueError):
+            helper_params = None
+
+        if helper_params is not None and len(helper_params) <= 1:
+            return _get_main_grad_attr(weight)
+        return _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
+
     if parallel_state.is_rank_in_embedding_group(ignore_virtual=True) and torch.distributed.get_world_size(
             embd_group) > 1:
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
@@ -77,7 +87,7 @@ def _allreduce_word_embedding_grads_allow_none(*call_args, **call_kwargs):
                 )
                 return
 
-            grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
+            grad_attr = _get_main_grad_attr_compat(weight, ddp_config)
             orig_grad = getattr(weight, grad_attr, None)
             grad = _unshard_if_dtensor(orig_grad)
             if grad is None:
