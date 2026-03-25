@@ -15,6 +15,84 @@ _GLOBAL_ARGS: Optional['TwinkleMegatronArgs'] = None
 logger = get_logger()
 
 
+def _normalize_word_embedding_allreduce_call(*call_args, **call_kwargs):
+    """Normalize Megatron's private word-embedding helper call.
+
+    Megatron Core has changed the helper signature across releases:
+    - 0.12.1: (model, config)
+    - 0.16.1: (model, config, embd_group, pp_group)
+    - future releases may add more positional/keyword args.
+
+    We keep the semantics stable and only normalize the known pieces.
+    """
+    model = call_kwargs.pop('model', call_args[0] if call_args else None)
+    config = call_kwargs.pop('config', call_args[1] if len(call_args) > 1 else None)
+    if model is None or config is None:
+        raise TypeError('word-embedding finalize helper requires at least model and config arguments.')
+
+    embd_group = call_kwargs.pop('embd_group', call_args[2] if len(call_args) > 2 else None)
+    pp_group = call_kwargs.pop('pp_group', call_args[3] if len(call_args) > 3 else None)
+    return model, config, embd_group, pp_group, call_kwargs
+
+
+def _allreduce_word_embedding_grads_allow_none(*call_args, **call_kwargs):
+    """None-safe drop-in for Megatron's private embedding all-reduce helper.
+
+    This wrapper intentionally accepts arbitrary positional/keyword arguments so
+    it can survive Megatron helper signature drift across versions.
+    """
+    from megatron.core import parallel_state
+    from megatron.core.distributed.finalize_model_grads import (
+        _get_main_grad_attr,
+        _reshard_if_dtensor,
+        _unshard_if_dtensor,
+        get_attr_wrapped_model,
+    )
+
+    model, config, embd_group, pp_group, _ = _normalize_word_embedding_allreduce_call(*call_args, **call_kwargs)
+    if embd_group is None:
+        embd_group = parallel_state.get_embedding_group()
+    if pp_group is None:
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+    if parallel_state.is_rank_in_embedding_group(ignore_virtual=True) and torch.distributed.get_world_size(
+            embd_group) > 1:
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            model_module = model[0]
+        elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            model_module = model[-1]
+        else:
+            model_module = model[0]
+
+        ddp_config = model_module.ddp_config
+        model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
+
+        if model_module.share_embeddings_and_output_weights or getattr(config, 'mtp_num_layers', 0):
+            weight = model_module.shared_embedding_or_output_weight()
+            if weight is None:
+                logger.warning_once(
+                    'Megatron LoRA finalize skipped shared embedding/output weight all-reduce '
+                    'because the tied weight is missing on this pipeline stage.',
+                    hash_id='megatron_lora_skip_embedding_allreduce_missing_weight',
+                )
+                return
+
+            grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
+            orig_grad = getattr(weight, grad_attr, None)
+            grad = _unshard_if_dtensor(orig_grad)
+            if grad is None:
+                logger.warning_once(
+                    'Megatron LoRA finalize skipped shared embedding/output weight all-reduce '
+                    'because the tied weight has no grad. This is expected when LoRA freezes '
+                    'the base embedding/output weight.',
+                    hash_id='megatron_lora_skip_embedding_allreduce_none_grad',
+                )
+                return
+
+            torch.distributed.all_reduce(grad, group=embd_group)
+            setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+
+
 def get_args() -> 'TwinkleMegatronArgs':
     """Get the global TwinkleMegatronArgs instance.
 
@@ -505,51 +583,6 @@ class TwinkleMegatronArgs:
                 if isinstance(m, _PeftModel):
                     return _get_base_model(m.base_model.model)
                 return m
-
-            def _allreduce_word_embedding_grads_allow_none(model, config):
-                """None-safe drop-in for Megatron's _allreduce_word_embedding_grads.
-
-                Skips all-reduce when weight is absent (pipeline stage without tied
-                weight) or grad is None (LoRA-frozen base embedding/output weight).
-                """
-                if (
-                    parallel_state.is_rank_in_embedding_group(ignore_virtual=True)
-                    and torch.distributed.get_world_size(parallel_state.get_embedding_group()) > 1
-                ):
-                    if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
-                        model_module = model[0]
-                    elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-                        model_module = model[-1]
-                    else:
-                        model_module = model[0]
-
-                    ddp_config = model_module.ddp_config
-                    model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
-
-                    if model_module.share_embeddings_and_output_weights or getattr(config, 'mtp_num_layers', 0):
-                        weight = model_module.shared_embedding_or_output_weight()
-                        if weight is None:
-                            logger.warning_once(
-                                'Megatron LoRA finalize skipped shared embedding/output weight all-reduce '
-                                'because the tied weight is missing on this pipeline stage.',
-                                hash_id='megatron_lora_skip_embedding_allreduce_missing_weight',
-                            )
-                            return
-
-                        grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
-                        orig_grad = getattr(weight, grad_attr, None)
-                        grad = _unshard_if_dtensor(orig_grad)
-                        if grad is None:
-                            logger.warning_once(
-                                'Megatron LoRA finalize skipped shared embedding/output weight all-reduce '
-                                'because the tied weight has no grad. This is expected when LoRA freezes '
-                                'the base embedding/output weight.',
-                                hash_id='megatron_lora_skip_embedding_allreduce_none_grad',
-                            )
-                            return
-
-                        torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
-                        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
             # Fix 1: check real DDP capability, not just ddp_config presence.
             base_model = _get_base_model(model[0])
