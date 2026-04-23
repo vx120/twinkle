@@ -118,6 +118,9 @@ class VLLMEngine(BaseSamplerEngine):
     def _create_engine(self):
         """Create and return the vLLM engine."""
         os.environ['VLLM_USE_V1'] = '1'
+        if Torch.is_npu_available():
+            from twinkle.patch.vllm_ascend import check_vllm_ascend_before_server_launch
+            check_vllm_ascend_before_server_launch()
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext
         from vllm.v1.engine.async_llm import AsyncLLM

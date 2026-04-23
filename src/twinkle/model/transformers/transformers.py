@@ -181,6 +181,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         else:
             self.hf_config = config
+        self._apply_runtime_pre_init_patches()
         if model_cls is None and hasattr(self.hf_config, 'architectures'):
             model_cls = self.hf_config.architectures[0]
         if model_cls is None:
@@ -193,6 +194,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             # Trigger transformers' FSDP-aware loading: meta-device init + rank-0-only weight load.
             with self.strategy.pretrained_load_context():
                 self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
+        self._apply_runtime_post_init_patches()
         self.model.gradient_checkpointing_enable()
         self.sp_strategy = None
         self._model_wrapped = False
@@ -201,6 +203,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         }
         self.optimizer_group[_default_adapter_name].adapter_name = _default_adapter_name
         self.active_group = _default_adapter_name
+
+    def _apply_runtime_pre_init_patches(self) -> None:
+        if Torch.is_npu_available():
+            from twinkle.patch import transformers_npu  # noqa: F401
+
+    def _apply_runtime_post_init_patches(self) -> None:
+        model_type = getattr(self.hf_config, 'model_type', None)
+        if model_type in {'qwen3_5', 'qwen3_5_moe'}:
+            from .qwen3_5_transformers import patch_qwen3_5_model
+            patch_qwen3_5_model(self.model)
 
     def _decide_strategy(self, strategy: Literal['accelerate', 'native_fsdp']):
         self._expert_parallel_config = self._fsdp_config.pop('expert_parallel', None)
